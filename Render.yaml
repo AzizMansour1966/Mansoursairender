@@ -3,11 +3,14 @@ services:
     name: mansourai-bot
     env: python
     plan: free
-    rootDir: src
-    buildCommand: "pip install -r ../requirements.txt"
-    startCommand: "ython src/main.py"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python src/main.py"
     envVars:
       - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_PROJECT
         sync: false
       - key: WEBHOOK_URL
         sync: false
