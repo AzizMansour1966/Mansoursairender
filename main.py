@@ -1,140 +1,142 @@
-#
 import os
-import json
+import asyncio
 import threading
+import functools
+
 from flask import Flask
-from telegram import Update, InputFile
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from openai import OpenAI
 from pydub import AudioSegment
-import requests
+import openai
 
-# 🔐 ENV variables
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-OPENAI_PROJECT = os.environ["OPENAI_PROJECT"]
+# New imports for PTB v20+ (Application, handlers, filters)
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# 🧠 Setup OpenAI
-client = OpenAI(api_key=OPENAI_API_KEY, organization=OPENAI_PROJECT)
+# Load API keys from environment variables (set these in Render dashboard)
+TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# 🚀 Flask app to keep alive
-flask_app = Flask(__name__)
-@flask_app.route("/")
-def home():
-    return "✅ MansourAI bot is alive!"
-
+# Flask app for keep-alive heartbeat (Render expects an HTTP server on $PORT)
+app = Flask(__name__)
+@app.route('/')
 def keep_alive():
-    flask_app.run(host="0.0.0.0", port=8080)
+    return "Bot is running", 200
 
-# 🗂 Memory directory
-if not os.path.exists("memory"):
-    os.makedirs("memory")
+def run_flask():
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 
-# 🧠 Get or create memory
-def get_memory(user_id):
-    path = f"memory/{user_id}.json"
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    else:
-        return {"history": [], "personality": "You are a helpful assistant."}
+# Start Flask server in a background thread (non-blocking)
+threading.Thread(target=run_flask, daemon=True).start()
 
-def save_memory(user_id, memory):
-    with open(f"memory/{user_id}.json", "w") as f:
-        json.dump(memory, f)
+# --- Define bot command and message handlers (async for PTB v20+):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /start command."""
+    # In PTB v20+, sending messages is async, so we use await
+    await update.message.reply_text(
+        "Hello! I am your AI bot. Send a text or voice message and I'll reply with GPT. "
+        "Use /setpersonality to change my style."
+    )
 
-# 💬 Start command
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hello! I'm MansourAI, powered by GPT-4o. Send a message or voice note to begin.")
+async def set_personality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /setpersonality <persona> command to set the bot's personality."""
+    persona = " ".join(context.args)
+    if not persona:
+        await update.message.reply_text("Usage: /setpersonality <personality description>")
+        return
+    # Store the personality in user_data (per-user persistent context)
+    context.user_data["personality"] = persona
+    await update.message.reply_text(f"Personality set! I will now respond with the style: \"{persona}\"")
 
-# 🧠 Set personality
-async def set_personality(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    personality = " ".join(context.args)
-    memory = get_memory(user_id)
-    memory["personality"] = personality
-    save_memory(user_id, memory)
-    await update.message.reply_text(f"🧠 Personality updated to:\n\n“{personality}”")
+async def say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /say <message> command to get a GPT-based response to a prompt."""
+    user_message = " ".join(context.args)
+    if not user_message:
+        await update.message.reply_text("Usage: /say <message>")
+        return
+    # Build the OpenAI ChatCompletion request with optional personality
+    personality = context.user_data.get("personality")
+    messages = []
+    if personality:
+        # Include persona as a system message so GPT knows the style
+        messages.append({"role": "system", "content": personality})
+    messages.append({"role": "user", "content": user_message})
+    # Call OpenAI GPT (this is blocking, so run it in an executor to avoid freezing the bot)
+    loop = asyncio.get_running_loop()
+    response = await loop.run_in_executor(
+        None,
+        functools.partial(openai.ChatCompletion.create, model="gpt-3.5-turbo", messages=messages)
+    )
+    reply_text = response['choices'][0]['message']['content'].strip()
+    await update.message.reply_text(reply_text)
 
-# 🧠 Chat handler
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_input = update.message.text
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for regular text messages (not commands)."""
+    user_message = update.message.text.strip()
+    # Build messages for GPT, including personality if set
+    personality = context.user_data.get("personality")
+    messages = []
+    if personality:
+        messages.append({"role": "system", "content": personality})
+    messages.append({"role": "user", "content": user_message})
+    # Call OpenAI to get a response (run in executor to avoid blocking)
+    loop = asyncio.get_running_loop()
+    response = await loop.run_in_executor(
+        None,
+        functools.partial(openai.ChatCompletion.create, model="gpt-3.5-turbo", messages=messages)
+    )
+    reply_text = response['choices'][0]['message']['content'].strip()
+    await update.message.reply_text(reply_text)
 
-    memory = get_memory(user_id)
-    memory["history"].append({"role": "user", "content": user_input})
-
-    messages = [{"role": "system", "content": memory["personality"]}] + memory["history"]
-
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for voice messages: transcribe with Whisper, then reply with GPT."""
+    voice_file = await context.bot.get_file(update.message.voice.file_id)  # Async get file
+    # Download the voice file to disk (async). Use unique name to avoid collisions.
+    ogg_path = f"voice_{update.effective_chat.id}_{update.message.message_id}.ogg"
+    await voice_file.download(custom_path=ogg_path)  # PTB v20+: File.download is async
+    # Convert OGG (Opus) to WAV using pydub (requires ffmpeg in environment)
+    audio = AudioSegment.from_file(ogg_path)
+    wav_path = f"voice_{update.effective_chat.id}_{update.message.message_id}.wav"
+    audio.export(wav_path, format="wav")
+    # Transcribe audio to text via OpenAI Whisper API (blocking call offloaded to executor)
+    def transcribe(path):
+        with open(path, "rb") as audio_file:
+            return openai.Audio.transcribe("whisper-1", audio_file)
+    loop = asyncio.get_running_loop()
+    transcript = await loop.run_in_executor(None, transcribe, wav_path)
+    transcribed_text = transcript.get("text", "").strip()
+    # Clean up temp audio files
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-        )
-        reply = response.choices[0].message.content
-        memory["history"].append({"role": "assistant", "content": reply})
-        save_memory(user_id, memory)
-        await update.message.reply_text(reply)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {e}")
+        os.remove(ogg_path)
+        os.remove(wav_path)
+    except OSError:
+        pass
+    if not transcribed_text:
+        await update.message.reply_text("⚠️ Sorry, I couldn't transcribe that voice message.")
+        return
+    # Prepare GPT query with the transcribed text
+    personality = context.user_data.get("personality")
+    messages = []
+    if personality:
+        messages.append({"role": "system", "content": personality})
+    messages.append({"role": "user", "content": transcribed_text})
+    # Call GPT to generate a reply (in executor to avoid blocking the event loop)
+    response = await loop.run_in_executor(
+        None,
+        functools.partial(openai.ChatCompletion.create, model="gpt-3.5-turbo", messages=messages)
+    )
+    reply_text = response['choices'][0]['message']['content'].strip()
+    await update.message.reply_text(reply_text)
 
-# 🎙 Voice input
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    voice = await update.message.voice.get_file()
-    voice_path = f"audio/{user_id}.ogg"
-    mp3_path = f"audio/{user_id}.mp3"
+# --- Set up the Telegram bot application (ApplicationBuilder replaces Updater in v20+):
+application = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
+# Register handlers with the application (no Dispatcher needed in v20+)
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("setpersonality", set_personality))
+application.add_handler(CommandHandler("say", say))
+# Use new filters module (lowercase) instead of Filters class
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+application.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    if not os.path.exists("audio"):
-        os.makedirs("audio")
-
-    await voice.download_to_drive(voice_path)
-
-    # Convert to mp3 using pydub
-    AudioSegment.from_file(voice_path).export(mp3_path, format="mp3")
-
-    # Transcribe using Whisper
-    try:
-        with open(mp3_path, "rb") as f:
-            transcript = client.audio.transcriptions.create(model="whisper-1", file=f)
-        update.message.text = transcript.text
-        await handle_text(update, context)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Transcription failed: {e}")
-
-# 🔊 Voice reply
-async def tts_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text[5:]  # remove "/say "
-    user_id = update.effective_user.id
-
-    try:
-        speech = client.audio.speech.create(
-            model="tts-1",
-            voice="nova",
-            input=text
-        )
-        output_path = f"audio/{user_id}_reply.mp3"
-        speech.stream_to_file(output_path)
-
-        await update.message.reply_voice(voice=InputFile(output_path))
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ TTS failed: {e}")
-
-# 🚀 Launch the bot
-async def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("setpersonality", set_personality))
-    app.add_handler(CommandHandler("say", tts_reply))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-
-    print("🤖 GPT-4o bot (Memory + Voice Input + Voice Reply) running...")
-    await app.run_polling()
-
+# Run the bot until it is stopped (replaces updater.start_polling() & updater.idle())
 if __name__ == "__main__":
-    threading.Thread(target=keep_alive).start()
-
-    import asyncio
-    asyncio.run(main())
+    application.run_polling()
