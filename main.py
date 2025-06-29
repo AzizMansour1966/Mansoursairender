@@ -135,5 +135,12 @@ async def main():
 if __name__ == "__main__":
     threading.Thread(target=keep_alive).start()
 
-    import asyncio
-    asyncio.run(main())
+ import asyncio
+
+if __name__ == "__main__":
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(main())  # non-blocking
+        loop.run_forever()
+    except RuntimeError:
+        asyncio.run(main())
